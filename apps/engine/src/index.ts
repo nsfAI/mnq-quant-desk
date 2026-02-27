@@ -18,8 +18,8 @@ type Signal = {
 };
 
 const app = express();
+app.use(express.json());
 
-// ✅ Allow dashboard (localhost:3000) to call /health
 app.use(
   cors({
     origin: ["http://localhost:3000"],
@@ -29,22 +29,79 @@ app.use(
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
+/**
+ * CONFIG
+ */
 const MIN_SECONDS_BETWEEN_SIGNALS = 15;
 const DAILY_MAX_LOSS = -500;
 
+/**
+ * STATE
+ */
 let dailyPnl = 0;
 let lastSignalTs = 0;
+let locked = false;
 
+function recomputeLock() {
+  locked = locked || dailyPnl <= DAILY_MAX_LOSS;
+}
+
+/**
+ * HEALTH
+ */
 app.get("/health", (_req, res) => {
+  recomputeLock();
   res.json({
     status: "ok",
     engine: "mnq-quant-desk",
     dailyPnl,
-    lockout: dailyPnl <= DAILY_MAX_LOSS,
+    lockout: locked,
+    dailyMaxLoss: DAILY_MAX_LOSS,
     minSecondsBetweenSignals: MIN_SECONDS_BETWEEN_SIGNALS,
   });
 });
 
+/**
+ * SET PNL (manual)
+ * body: { dailyPnl: number }
+ */
+app.post("/pnl", (req, res) => {
+  const n = Number(req.body?.dailyPnl);
+  if (!Number.isFinite(n)) {
+    return res.status(400).json({ ok: false, error: "dailyPnl must be a number" });
+  }
+  dailyPnl = n;
+  recomputeLock();
+  return res.json({ ok: true, dailyPnl, lockout: locked });
+});
+
+/**
+ * RESET DAY
+ */
+app.post("/reset", (_req, res) => {
+  dailyPnl = 0;
+  lastSignalTs = 0;
+  locked = false;
+  return res.json({ ok: true, dailyPnl, lockout: locked });
+});
+
+/**
+ * MANUAL LOCK/UNLOCK (optional safety)
+ * body: { locked: boolean }
+ */
+app.post("/lock", (req, res) => {
+  const v = req.body?.locked;
+  if (typeof v !== "boolean") {
+    return res.status(400).json({ ok: false, error: "locked must be boolean" });
+  }
+  locked = v;
+  recomputeLock();
+  return res.json({ ok: true, lockout: locked, dailyPnl });
+});
+
+/**
+ * WS BROADCAST
+ */
 function broadcast(payload: unknown) {
   const msg = JSON.stringify(payload);
   wss.clients.forEach((client: any) => {
@@ -52,6 +109,9 @@ function broadcast(payload: unknown) {
   });
 }
 
+/**
+ * MOCK SIGNAL (placeholder)
+ */
 function makeMockSignal(): Signal {
   return {
     type: "signal",
@@ -68,10 +128,15 @@ function makeMockSignal(): Signal {
   };
 }
 
+/**
+ * LOOP
+ */
 setInterval(() => {
   const now = Date.now();
 
-  if (dailyPnl <= DAILY_MAX_LOSS) return;
+  recomputeLock();
+  if (locked) return;
+
   if (now - lastSignalTs < MIN_SECONDS_BETWEEN_SIGNALS * 1000) return;
 
   const signal = makeMockSignal();
@@ -81,6 +146,9 @@ setInterval(() => {
   lastSignalTs = now;
 }, 1000);
 
+/**
+ * START
+ */
 server.listen(8787, () => {
   console.log("Engine running:");
   console.log("  HTTP: http://localhost:8787/health");
