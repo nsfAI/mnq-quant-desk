@@ -18,6 +18,7 @@ type Health = {
   engine: string;
   dailyPnl: number;
   lockout: boolean;
+  dailyMaxLoss: number;
   minSecondsBetweenSignals: number;
 };
 
@@ -43,11 +44,13 @@ export default function Page() {
   const [health, setHealth] = useState<Health | null>(null);
   const [healthStatus, setHealthStatus] = useState<"ok" | "down">("down");
 
-  // You can later override these via env vars when deploying
-  const engineHttp = useMemo(() => "http://localhost:8787/health", []);
+  const [pnlInput, setPnlInput] = useState<string>("0");
+  const [busy, setBusy] = useState(false);
+
+  const engineHttp = useMemo(() => "http://localhost:8787", []);
   const engineWs = useMemo(() => "ws://localhost:8787", []);
 
-  // WebSocket for live signals
+  // WebSocket signals
   useEffect(() => {
     const ws = new WebSocket(engineWs);
 
@@ -67,28 +70,27 @@ export default function Page() {
     return () => ws.close();
   }, [engineWs]);
 
-  // Poll /health for engine state + lockout
+  // Poll /health
   useEffect(() => {
     let cancelled = false;
 
     async function poll() {
       try {
-        const res = await fetch(engineHttp, { cache: "no-store" });
+        const res = await fetch(`${engineHttp}/health`, { cache: "no-store" });
         if (!res.ok) throw new Error("bad response");
         const json = (await res.json()) as Health;
         if (!cancelled) {
           setHealth(json);
           setHealthStatus("ok");
+          setPnlInput(String(json.dailyPnl));
         }
       } catch {
-        if (!cancelled) {
-          setHealthStatus("down");
-        }
+        if (!cancelled) setHealthStatus("down");
       }
     }
 
     poll();
-    const id = setInterval(poll, 2000);
+    const id = setInterval(poll, 1500);
     return () => {
       cancelled = true;
       clearInterval(id);
@@ -96,8 +98,45 @@ export default function Page() {
   }, [engineHttp]);
 
   const latest = signals[0];
-
   const lockout = health?.lockout ?? false;
+
+  async function setPnl() {
+    const n = Number(pnlInput);
+    if (!Number.isFinite(n)) return;
+
+    setBusy(true);
+    try {
+      await fetch(`${engineHttp}/pnl`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ dailyPnl: n }),
+      });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function resetDay() {
+    setBusy(true);
+    try {
+      await fetch(`${engineHttp}/reset`, { method: "POST" });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function toggleLock() {
+    setBusy(true);
+    try {
+      await fetch(`${engineHttp}/lock`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ locked: !(health?.lockout ?? false) }),
+      });
+    } finally {
+      setBusy(false);
+    }
+  }
 
   return (
     <main className="min-h-screen p-8">
@@ -105,9 +144,7 @@ export default function Page() {
         <header className="flex items-start justify-between gap-4">
           <div>
             <h1 className="text-2xl font-semibold">MNQ Quant Desk</h1>
-            <p className="text-sm opacity-70">
-              Live alerts (manual execution in Tradovate). RTH only.
-            </p>
+            <p className="text-sm opacity-70">Live alerts (manual execution in Tradovate). RTH only.</p>
           </div>
 
           <div className="text-right text-sm">
@@ -119,31 +156,68 @@ export default function Page() {
               />
             </div>
             <div className="mt-1">
-              Health:{" "}
-              <StatusPill
-                label={healthStatus}
-                tone={healthStatus === "ok" ? "good" : "bad"}
-              />
+              Health: <StatusPill label={healthStatus} tone={healthStatus === "ok" ? "good" : "bad"} />
             </div>
           </div>
         </header>
 
         {lockout && (
           <div className="rounded-2xl border border-red-300 bg-red-50 p-4">
-            <div className="font-semibold text-red-800">Trading Locked (Daily Max Loss Hit)</div>
+            <div className="font-semibold text-red-800">Signals Paused (Lockout Active)</div>
             <div className="text-sm text-red-700 mt-1">
-              Engine is in lockout mode. Signals are paused because dailyPnL ≤ -$500.
+              Daily PnL is at or below the max loss limit. Engine will not emit signals.
             </div>
           </div>
         )}
 
         <section className="grid grid-cols-1 gap-4 md:grid-cols-3">
           <Card title="Daily PnL" value={health ? formatUsd(health.dailyPnl) : "—"} />
-          <Card
-            title="Min Signal Spacing"
-            value={health ? `${health.minSecondsBetweenSignals}s` : "—"}
-          />
-          <Card title="Engine" value={health?.engine ?? "—"} />
+          <Card title="Daily Max Loss" value={health ? formatUsd(health.dailyMaxLoss) : "—"} />
+          <Card title="Min Signal Spacing" value={health ? `${health.minSecondsBetweenSignals}s` : "—"} />
+        </section>
+
+        <section className="rounded-2xl border p-4">
+          <div className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
+            <div>
+              <div className="text-sm font-semibold">Controls</div>
+              <div className="text-xs opacity-70">Manual risk control while you execute trades in Tradovate.</div>
+            </div>
+
+            <div className="flex flex-col gap-2 md:flex-row md:items-center">
+              <div className="flex items-center gap-2">
+                <label className="text-sm opacity-70">Set Daily PnL</label>
+                <input
+                  className="w-32 rounded-xl border px-3 py-2 text-sm"
+                  value={pnlInput}
+                  onChange={(e) => setPnlInput(e.target.value)}
+                  inputMode="decimal"
+                />
+                <button
+                  className="rounded-xl border px-3 py-2 text-sm hover:bg-black/5 disabled:opacity-50"
+                  onClick={setPnl}
+                  disabled={busy || healthStatus !== "ok"}
+                >
+                  Apply
+                </button>
+              </div>
+
+              <button
+                className="rounded-xl border px-3 py-2 text-sm hover:bg-black/5 disabled:opacity-50"
+                onClick={resetDay}
+                disabled={busy || healthStatus !== "ok"}
+              >
+                Reset Day
+              </button>
+
+              <button
+                className="rounded-xl border px-3 py-2 text-sm hover:bg-black/5 disabled:opacity-50"
+                onClick={toggleLock}
+                disabled={busy || healthStatus !== "ok"}
+              >
+                {lockout ? "Unlock" : "Lock"}
+              </button>
+            </div>
+          </div>
         </section>
 
         {latest ? (
@@ -152,9 +226,7 @@ export default function Page() {
               <div className="text-xl font-semibold">
                 {latest.side} — {latest.symbol}
               </div>
-              <div className="text-sm opacity-70">
-                {new Date(latest.ts).toLocaleTimeString()}
-              </div>
+              <div className="text-sm opacity-70">{new Date(latest.ts).toLocaleTimeString()}</div>
             </div>
 
             <div className="mt-4 grid grid-cols-3 gap-3">
@@ -169,10 +241,10 @@ export default function Page() {
             <div className="mt-4 rounded-xl bg-black/5 p-3 text-sm">
               <div className="font-semibold">Manual execution checklist</div>
               <ul className="list-disc pl-5 mt-1 opacity-80">
-                <li>Confirm MNQ contract + 5 contracts</li>
+                <li>Confirm MNQ contract + up to 5 contracts</li>
                 <li>Place bracket: target {latest.targetTicks} ticks, stop {latest.stopTicks} ticks</li>
-                <li>Use time stop: flatten if not working in {latest.timeStopSec}s</li>
-                <li>If you’re down bad, stop — system will lock at -$500</li>
+                <li>Time stop: flatten if not working in {latest.timeStopSec}s</li>
+                <li>If you’re down bad, set PnL and let lockout protect you</li>
               </ul>
             </div>
           </div>
@@ -202,7 +274,7 @@ export default function Page() {
         </section>
 
         <footer className="text-xs opacity-60">
-          Next step: replace mock signals with real microstructure logic and feed from Sierra (DTC).
+          Next: plug real market data into strategy + backtest on 1 month.
         </footer>
       </div>
     </main>
